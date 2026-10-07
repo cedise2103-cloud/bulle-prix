@@ -1,0 +1,358 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate project
+        run: |
+          mkdir -p VeepeeBubble
+          cat > VeepeeBubble/README.txt <<'FILE_EOF'
+          Bulle Prix - prototype (lecture de l'ecran via accessibilite)
+
+          1. Installer Android Studio, puis File > Open > dossier VeepeeBubble.
+          2. Brancher le telephone (debogage USB) ou creer l'APK : Build > Build APK(s).
+          3. Installer l'APK. Android 13+ : Parametres > Applications > Bulle Prix > menu "..." >
+             "Autoriser les parametres restreints", puis activer le service dans Accessibilite.
+          4. Ouvrir Veepee sur une fiche produit : la bulle affiche le prix lu.
+             Appui long sur la bulle = copie du texte lu (a me coller pour ajuster la detection).
+          FILE_EOF
+          mkdir -p VeepeeBubble/app
+          cat > VeepeeBubble/app/build.gradle.kts <<'FILE_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "fr.ced.bubble"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "fr.ced.bubble"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          FILE_EOF
+          mkdir -p VeepeeBubble/app/src/main
+          cat > VeepeeBubble/app/src/main/AndroidManifest.xml <<'FILE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".PriceAccessibilityService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          FILE_EOF
+          mkdir -p VeepeeBubble/app/src/main/java/fr/ced/bubble
+          cat > VeepeeBubble/app/src/main/java/fr/ced/bubble/MainActivity.kt <<'FILE_EOF'
+          package fr.ced.bubble
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  layout.addView(TextView(this).apply {
+                      text = "Bulle Prix (prototype)\n\n1) Active le service d'accessibilitÃ© Â« Bulle Prix Â».\n2) Ouvre Veepee : une bulle affiche le prix lu Ã  l'Ã©cran.\n3) Appui long sur la bulle = copie le texte lu."
+                      textSize = 16f
+                  })
+                  layout.addView(Button(this).apply {
+                      text = "Ouvrir les rÃ©glages d'accessibilitÃ©"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  layout.addView(TextView(this).apply {
+                      text = "\nFiltre d'appli (ex : veepee). Vide = toutes les applis."
+                  })
+                  val input = EditText(this).apply {
+                      setText(prefs.getString("filter", ""))
+                      hint = "veepee"
+                      setSingleLine()
+                  }
+                  layout.addView(input)
+                  layout.addView(Button(this).apply {
+                      text = "Enregistrer le filtre"
+                      setOnClickListener {
+                          prefs.edit().putString("filter", input.text.toString().trim()).apply()
+                          Toast.makeText(context, "EnregistrÃ©", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+                  setContentView(layout)
+              }
+          }
+          FILE_EOF
+          mkdir -p VeepeeBubble/app/src/main/java/fr/ced/bubble
+          cat > VeepeeBubble/app/src/main/java/fr/ced/bubble/PriceAccessibilityService.kt <<'FILE_EOF'
+          package fr.ced.bubble
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class PriceAccessibilityService : AccessibilityService() {
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val scanRunnable = Runnable { scan() }
+              private var bubble: TextView? = null
+              private var expanded = true
+              private var shortText = ""
+              private var longText = ""
+              private var lastDump = ""
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  val pkg = event?.packageName?.toString() ?: return
+                  if (pkg == packageName || pkg == "com.android.systemui") return
+                  handler.removeCallbacks(scanRunnable)
+                  handler.postDelayed(scanRunnable, 700)
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  removeBubble()
+                  super.onDestroy()
+              }
+
+              private fun scan() {
+                  val root = rootInActiveWindow ?: return
+                  val pkg = root.packageName?.toString() ?: return
+                  if (pkg == packageName || pkg == "com.android.systemui") return
+
+                  val filter = getSharedPreferences("cfg", MODE_PRIVATE).getString("filter", "")!!.trim()
+                  if (filter.isNotEmpty() && !pkg.contains(filter, ignoreCase = true)) {
+                      removeBubble()
+                      return
+                  }
+
+                  val texts = ArrayList<String>()
+                  collect(root, texts, 0)
+                  val r = ScreenParser.parse(texts)
+                  lastDump = "package: $pkg\n" + texts.joinToString("\n")
+
+                  if (texts.isEmpty()) {
+                      shortText = "âš  Ã‰cran illisible"
+                      longText = "Aucun texte lu dans $pkg.\nL'appli bloque peut-Ãªtre l'accessibilitÃ© (plan B : capture d'Ã©cran)."
+                  } else if (r.prices.isEmpty()) {
+                      shortText = "Aucun prix dÃ©tectÃ©"
+                      longText = "$pkg\n${texts.size} textes lus, pas de prix en â‚¬.\nAppui long = copier le texte lu."
+                  } else {
+                      val fmt = { v: Double -> String.format(java.util.Locale.FRANCE, "%.2f â‚¬", v) }
+                      val low = r.prices.first()
+                      val high = r.prices.last()
+                      shortText = if (low == high) fmt(low) else "${fmt(low)}  (barrÃ© ${fmt(high)})"
+                      longText = buildString {
+                          append(shortText)
+                          r.discountPercent?.let { append("\nRemise affichÃ©e : -$it %") }
+                          append("\nProduit ? ${r.title ?: "non dÃ©tectÃ©"}")
+                          append("\nPrix lus : ${r.prices.joinToString(" Â· ") { fmt(it) }}")
+                          append("\n[$pkg]  appui long = copier")
+                      }
+                  }
+                  show()
+              }
+
+              private fun collect(n: AccessibilityNodeInfo?, out: MutableList<String>, depth: Int) {
+                  if (n == null || depth > 40) return
+                  n.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+                  n.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+                  for (i in 0 until n.childCount) collect(n.getChild(i), out, depth + 1)
+              }
+
+              private fun show() {
+                  val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  if (bubble == null) {
+                      val tv = TextView(this).apply {
+                          setTextColor(Color.WHITE)
+                          textSize = 13f
+                          maxWidth = 760
+                          setPadding(28, 18, 28, 18)
+                          background = GradientDrawable().apply {
+                              cornerRadius = 40f
+                              setColor(Color.parseColor("#E6222222"))
+                          }
+                          setOnClickListener { expanded = !expanded; render() }
+                          setOnLongClickListener {
+                              val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                              cm.setPrimaryClip(ClipData.newPlainText("dump", lastDump))
+                              Toast.makeText(context, "Texte de l'Ã©cran copiÃ©", Toast.LENGTH_SHORT).show()
+                              true
+                          }
+                      }
+                      val lp = WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                          PixelFormat.TRANSLUCENT
+                      ).apply {
+                          gravity = Gravity.TOP or Gravity.END
+                          x = 16
+                          y = 220
+                      }
+                      wm.addView(tv, lp)
+                      bubble = tv
+                  }
+                  render()
+              }
+
+              private fun render() {
+                  bubble?.text = if (expanded) longText else shortText
+              }
+
+              private fun removeBubble() {
+                  bubble?.let {
+                      try {
+                          (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it)
+                      } catch (_: Exception) {}
+                  }
+                  bubble = null
+              }
+          }
+          FILE_EOF
+          mkdir -p VeepeeBubble/app/src/main/java/fr/ced/bubble
+          cat > VeepeeBubble/app/src/main/java/fr/ced/bubble/ScreenParser.kt <<'FILE_EOF'
+          package fr.ced.bubble
+
+          data class ParsedScreen(
+              val title: String?,
+              val prices: List<Double>,
+              val discountPercent: Int?
+          )
+
+          object ScreenParser {
+              // Ex: "49â‚¬", "49,90 â‚¬", "1 299,00 â‚¬"
+              private val priceRx = Regex("""(\d{1,3}(?:[\u00a0 .]\d{3})+|\d+)(?:[.,](\d{1,2}))?\s?â‚¬""")
+              private val discountRx = Regex("""-\s?(\d{1,2})\s?%""")
+
+              fun parse(texts: List<String>): ParsedScreen {
+                  val prices = mutableSetOf<Double>()
+                  var discount: Int? = null
+                  for (t in texts) {
+                      for (m in priceRx.findAll(t)) {
+                          val intPart = m.groupValues[1].filter { it.isDigit() }
+                          val dec = m.groupValues[2].ifEmpty { "0" }
+                          val v = "$intPart.$dec".toDoubleOrNull()
+                          if (v != null && v > 0.0) prices.add(v)
+                      }
+                      discountRx.find(t)?.let { d ->
+                          val p = d.groupValues[1].toInt()
+                          if (discount == null || p > discount!!) discount = p
+                      }
+                  }
+                  // Titre candidat : texte le plus long (15-120 car.) sans prix
+                  val title = texts
+                      .filter { it.length in 15..120 && !it.contains("â‚¬") }
+                      .maxByOrNull { it.length }
+                  return ParsedScreen(title, prices.sorted(), discount)
+              }
+          }
+          FILE_EOF
+          mkdir -p VeepeeBubble/app/src/main/res/values
+          cat > VeepeeBubble/app/src/main/res/values/strings.xml <<'FILE_EOF'
+          <resources>
+              <string name="app_name">Bulle Prix</string>
+              <string name="service_desc">Lit le titre et le prix affichÃ©s Ã  l\'Ã©cran pour les comparer.</string>
+          </resources>
+          FILE_EOF
+          mkdir -p VeepeeBubble/app/src/main/res/xml
+          cat > VeepeeBubble/app/src/main/res/xml/accessibility_config.xml <<'FILE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowContentChanged|typeWindowStateChanged|typeViewScrolled"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="300"
+              android:description="@string/service_desc" />
+          FILE_EOF
+          mkdir -p VeepeeBubble
+          cat > VeepeeBubble/build.gradle.kts <<'FILE_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FILE_EOF
+          mkdir -p VeepeeBubble
+          cat > VeepeeBubble/gradle.properties <<'FILE_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          FILE_EOF
+          mkdir -p VeepeeBubble
+          cat > VeepeeBubble/settings.gradle.kts <<'FILE_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "VeepeeBubble"
+          include(":app")
+          FILE_EOF
+      - name: Build debug APK
+        working-directory: VeepeeBubble
+        run: gradle assembleDebug --no-daemon
+      - name: Publish APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Bulle Prix build ${{ github.run_number }}
+          files: VeepeeBubble/app/build/outputs/apk/debug/app-debug.apk
